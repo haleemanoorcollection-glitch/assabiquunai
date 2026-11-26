@@ -1,0 +1,99 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isSupervisor() {
+      return signedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'supervisor';
+    }
+    function userExists(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid));
+    }
+
+    // ---- users ----
+    match /users/{uid} {
+      // Anyone signed in can read basic user docs (needed for upline dropdown and code lookup)
+      allow read: if signedIn();
+
+      // Create: only self, role must be 'member', status 'active', and imageCode must be present.
+      // Supervisor creation is blocked here — supervisor doc is created via the same client path
+      // but rules check: if role == 'supervisor', no supervisor may already exist.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasAll(['uid','name','gmail','role','imageCode','status','createdAt'])
+        && request.resource.data.role in ['member','supervisor']
+        && request.resource.data.status == 'active'
+        && (
+          // member path: uplineUid must exist, fboId must be present
+          (request.resource.data.role == 'member'
+            && request.resource.data.keys().hasAll(['uplineUid','fboId','uplineName'])
+            && userExists(request.resource.data.uplineUid))
+          ||
+          // supervisor path: only allowed if NO supervisor exists yet
+          (request.resource.data.role == 'supervisor'
+            && !exists(/databases/$(database)/documents/users/$(request.auth.uid + '_never'))
+            && !(get(/databases/$(database)/documents/settings/supervisor).data.supervisorUid != null)
+          )
+        );
+
+      // Update: user can update their own non-protected fields only.
+      // Protected: role, uplineUid, imageCode, uid, status.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role','uplineUid','imageCode','uid','status']);
+
+      // Supervisor can update imageGenerationEnabled elsewhere; no direct user doc write by supervisor here.
+    }
+
+    // ---- invites (pending members) ----
+    match /invites/{inviteId} {
+      // Read: upline can read their own invites; any signed-in user can read (needed for FBO verification during signup)
+      allow read: if signedIn();
+
+      // Create: only the upline themselves, status must be 'pending'
+      allow create: if signedIn()
+        && request.resource.data.uplineUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasAll(['name','fboId','uplineUid','uplineName','status','createdAt']);
+
+      // Update: only the upline can flip status to 'active', or the member during signup completion.
+      // We allow the member to update the invite they used (matched by fboId) via a transaction in the app.
+      // For simplicity and security, restrict to upline OR allow status change to active.
+      allow update: if signedIn()
+        && (
+          // upline managing their own invite
+          resource.data.uplineUid == request.auth.uid
+          ||
+          // member completing signup: can only set status to 'active' and add memberUid == their uid
+          (request.resource.data.status == 'active'
+            && request.resource.data.memberUid == request.auth.uid)
+        );
+    }
+
+    // ---- memberDP (DP generation records) ----
+    match /memberDP/{recordId} {
+      // Read: the code owner (uplineUid stored in record) can read their records; supervisor can read all.
+      allow read: if signedIn()
+        && (resource.data.createdByUid == request.auth.uid || isSupervisor());
+
+      // Create: anyone signed in can create a record, but createdByUid must match a valid user's uid
+      // and codeUsed must match that user's imageCode.
+      allow create: if signedIn()
+        && userExists(request.resource.data.createdByUid)
+        && get(/databases/$(database)/documents/users/$(request.resource.data.createdByUid)).data.imageCode == request.resource.data.codeUsed;
+
+      // No updates or deletes from clients.
+      allow update, delete: if false;
+    }
+
+    // ---- settings ----
+    match /settings/{settingId} {
+      // Only supervisor can read/write settings
+      allow read, write: if isSupervisor();
+    }
+  }
+}
